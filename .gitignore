@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets & account state — never commit
+.env
+*.session.json
+session.json
+seen_messages.json
+links.json
+
+# Test artifacts
+.pytest_cache/
