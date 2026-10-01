@@ -96,7 +96,11 @@ def test_config_serves_the_configured_handle(tmp_path: Path):
     client = _client(tmp_path, Settings(ig_username="stashlyhq", ig_password="pw"))
     res = client.get("/auth/config")
     assert res.status_code == 200
-    assert res.json() == {"igUsername": "stashlyhq", "linkCommand": "/link"}
+    assert res.json() == {
+        "igUsername": "stashlyhq",
+        "linkCommand": "/link",
+        "instagramConfigured": True,
+    }
 
 
 def test_config_needs_no_api_key(tmp_path: Path):
@@ -109,4 +113,43 @@ def test_config_handle_is_empty_when_instagram_unconfigured(tmp_path: Path):
     """No creds => empty handle, never None, so the client can render a fallback."""
     res = _client(tmp_path, Settings()).get("/auth/config")
     assert res.status_code == 200
-    assert res.json() == {"igUsername": "", "linkCommand": "/link"}
+    assert res.json() == {
+        "igUsername": "",
+        "linkCommand": "/link",
+        "instagramConfigured": False,
+    }
+
+
+def test_config_flags_half_configured_instagram(tmp_path: Path):
+    """A username without a password cannot log in, so nothing would ever bind.
+
+    `igUsername` alone cannot express this — the client needs the explicit flag
+    to say "this server isn't linked to an account" rather than opening a DM that
+    the backend will never read.
+    """
+    res = _client(tmp_path, Settings(ig_username="stashlyhq")).get("/auth/config")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["igUsername"] == "stashlyhq"
+    assert body["instagramConfigured"] is False
+
+
+def test_register_returns_server_identity(tmp_path: Path):
+    """The DM target arrives with the code, so no second request is needed."""
+    client = _client(tmp_path, Settings(ig_username="stashlyhq", ig_password="pw"))
+    res = client.post("/auth/codes", json={"code": "999999"})
+    assert res.status_code == 201
+    body = res.json()
+    assert body["code"] == "999999"
+    assert body["igUsername"] == "stashlyhq"
+    assert body["linkCommand"] == "/link"
+    assert body["instagramConfigured"] is True
+
+
+def test_register_identity_matches_config_endpoint(tmp_path: Path):
+    """Both endpoints must agree, or the restart fallback contradicts Connect."""
+    client = _client(tmp_path, Settings(ig_username="stashlyhq", ig_password="pw"))
+    registered = client.post("/auth/codes", json={"code": "999999"}).json()
+    config = client.get("/auth/config").json()
+    for key in ("igUsername", "linkCommand", "instagramConfigured"):
+        assert registered[key] == config[key]

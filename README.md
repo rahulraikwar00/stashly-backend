@@ -74,7 +74,7 @@ DATABASE_URL=postgresql://... .venv/bin/python -m scripts.seed_from_json
 | Method | Path | Auth | Purpose | Consumes seen? |
 | --- | --- | --- | --- | --- |
 | GET | `/health` | open | liveness + database round-trip | no |
-| POST | `/auth/codes` | open | register a pending 6-digit code | — |
+| POST | `/auth/codes` | open | register a pending 6-digit code (+ the account to DM) | — |
 | GET | `/auth/config` | open | which account to DM (`igUsername`, `linkCommand`) | — |
 | GET | `/auth/status` | code | is my code linked? | no |
 | GET | `/messages/links` | code | **new forwarded reels, full bookmark shape** | **yes (drains buffer)** |
