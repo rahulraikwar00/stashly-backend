@@ -64,3 +64,16 @@ class AuthUnlinkResponse(BaseModel):
 class DebugResetResponse(BaseModel):
     status: str
     thread: str
+
+
+class ServerConfigResponse(BaseModel):
+    """Public server identity — the official account the user must DM.
+
+    Served instead of hardcoded in the client, which is how the handle drifted
+    between IG_USERNAME and the app more than once. `igUsername` is "" when
+    Instagram is not configured, never null, so the client can always render a
+    fallback rather than "@None".
+    """
+
+    igUsername: str = ""
+    linkCommand: str = "/link"

@@ -7,6 +7,7 @@ all bookmark shaping happens in `app/enrich.py`.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -19,6 +20,9 @@ from instagrapi.exceptions import LoginRequired
 from .base import Connector, FetchResult, InboundItem, LinkDirective
 
 log = logging.getLogger("connector.instagram")
+
+# Row name in `app_secrets` holding the AES-GCM encrypted Instagram session.
+SESSION_SECRET_NAME = "instagram"
 
 _LINK_RE = re.compile(r"^/link\s+(\d{6})\b", re.IGNORECASE)
 
@@ -89,6 +93,7 @@ class InstagramConnector(Connector):
         threads_per_fetch: int = 10,
         thread_message_limit: int = 40,
         burst_fetch_limit: int = 200,
+        secret_store=None,
     ) -> None:
         self._username = username
         self._password = password
@@ -96,17 +101,68 @@ class InstagramConnector(Connector):
         self._threads_per_fetch = threads_per_fetch
         self._thread_message_limit = thread_message_limit
         self._burst_fetch_limit = burst_fetch_limit
+        # D-018: when a secret store with a key is supplied the session is
+        # encrypted at rest; otherwise it stays in this process's memory only.
+        self._secrets = secret_store
         self._client: Client | None = None
         self._lock = threading.RLock()
 
     # ── session / auth ─────────────────────────────────────────────
 
+    def _load_session_bytes(self) -> bytes | None:
+        """Persisted session bytes, or None if unavailable or not permitted.
+
+        Order matters: the encrypted store wins, then the local file (local
+        development), and a store with no key yields nothing at all rather than
+        silently writing plaintext.
+        """
+        if self._secrets is not None and self._secrets.persistence_allowed:
+            blob = self._secrets.get(SESSION_SECRET_NAME)
+            if blob:
+                return blob
+        try:
+            if self._session_file.exists():
+                return self._session_file.read_bytes()
+        except OSError:
+            log.warning("Instagram: could not read local session file")
+        return None
+
+    def _store_session_bytes(self, blob: bytes) -> None:
+        if self._secrets is not None and self._secrets.persistence_allowed:
+            self._secrets.set(SESSION_SECRET_NAME, blob)
+            log.warning("Instagram: session persisted (encrypted).")
+            return
+        # No key configured: keep it in memory. Never write plaintext to disk.
+        if self._session_file.exists():
+            try:
+                self._session_file.unlink()
+            except OSError:
+                pass
+        log.warning("Instagram: session kept in memory (no IG_SESSION_KEY).")
+
+    def _session_bytes(self, client: Client) -> bytes:
+        """Serialize a client's session.
+
+        instagrapi's `dump_settings` is literally `json.dump(get_settings())`, so
+        going straight to the settings dict avoids writing the plaintext session
+        to a temp file on the way in or out.
+        """
+        return json.dumps(client.get_settings()).encode()
+
+    def _client_from_bytes(self, blob: bytes) -> Client:
+        """Rebuild a Client from persisted session bytes."""
+        client = Client()
+        client.set_settings(json.loads(blob.decode()))
+        client.login(self._username, self._password)
+        client.get_timeline_feed()  # cheap call proving the session works
+        return client
+
     def _fresh_client(self) -> Client:
-        """Login from scratch (ignore a cached session) and persist it."""
+        """Login from scratch and persist the new session."""
         client = Client()
         client.login(self._username, self._password)
-        client.dump_settings(self._session_file)
-        log.warning("Instagram: logged in fresh and cached session.")
+        self._store_session_bytes(self._session_bytes(client))
+        log.warning("Instagram: logged in fresh.")
         return client
 
     def _ensure_client(self) -> Client | None:
@@ -114,19 +170,16 @@ class InstagramConnector(Connector):
             if self._client is not None:
                 return self._client
             try:
-                if self._session_file.exists():
-                    cached = Client()
-                    cached.load_settings(self._session_file)
-                    cached.login(self._username, self._password)
-                    cached.get_timeline_feed()  # cheap call proving the session works
-                    self._client = cached
-                    log.warning("Instagram: reused cached session.")
-                    return cached
+                blob = self._load_session_bytes()
+                if blob:
+                    self._client = self._client_from_bytes(blob)
+                    log.warning("Instagram: reused persisted session.")
+                    return self._client
                 self._client = self._fresh_client()
                 return self._client
             except LoginRequired:
                 log.warning(
-                    "Instagram: cached session expired, logging in fresh.")
+                    "Instagram: persisted session expired, logging in fresh.")
                 self._client = self._fresh_client()
                 return self._client
             except Exception:
@@ -201,6 +254,58 @@ class InstagramConnector(Connector):
 
     # ── Connector API ──────────────────────────────────────────────
 
+    def _fetch_from_thread(
+        self,
+        client: Client,
+        thread: Any,
+        thread_key: str,
+        cursor: str | None,
+    ) -> FetchResult:
+        """Items after `cursor` for one already-resolved thread."""
+        if not thread.messages:
+            log.warning("Instagram: thread %s has no messages", thread_key)
+            return FetchResult()
+
+        raw = thread.messages  # newest-first
+
+        new_raw: list[Any] = []
+        boundary = None
+        for m in raw:
+            if cursor and m.id == cursor:
+                boundary = m
+                break
+            new_raw.append(m)
+
+        # Burst fallback: boundary not within the inline batch.
+        if boundary is None and cursor:
+            log.warning(
+                "Instagram: burst detected in thread %s, fetching deeper.", thread_key)
+            deeper = client.direct_messages(
+                thread_key, amount=self._burst_fetch_limit)
+            new_raw = []
+            boundary = None
+            for m in deeper:
+                if m.id == cursor:
+                    boundary = m
+                    break
+                new_raw.append(m)
+            raw = deeper or raw
+
+        if not new_raw:
+            return FetchResult()
+
+        context = [m for m in reversed(
+            new_raw) if m.user_id != client.user_id]
+        if boundary is not None:
+            context = [boundary] + context
+
+        items = self._items_from(context, thread.users, thread_key)
+        if boundary is not None:
+            items = [i for i in items if i.id != boundary.id]
+
+        cursor_new = raw[0].id if raw else None
+        return FetchResult(items=items, cursor=cursor_new)
+
     def fetch_new(self, thread_key: str | None, cursor: str | None) -> FetchResult:
         if not thread_key:
             log.warning("Instagram: fetch requested without a linked thread")
@@ -214,50 +319,46 @@ class InstagramConnector(Connector):
             threads = self._threads(client)
             thread = next(
                 (t for t in threads if str(t.id) == thread_key), None)
-            if thread is None or not thread.messages:
+            if thread is None:
                 log.warning(
                     "Instagram: linked thread %s not in the inbox batch", thread_key)
                 return FetchResult()
 
-            raw = thread.messages  # newest-first
+            return self._fetch_from_thread(client, thread, thread_key, cursor)
 
-            new_raw: list[Any] = []
-            boundary = None
-            for m in raw:
-                if cursor and m.id == cursor:
-                    boundary = m
-                    break
-                new_raw.append(m)
+    def fetch_many(
+        self,
+        thread_keys: list[str],
+        cursors: dict[str, str | None],
+    ) -> dict[str, FetchResult]:
+        """Serve every requested thread from ONE inbox listing.
 
-            # Burst fallback: boundary not within the inline batch.
-            if boundary is None and cursor:
-                log.warning(
-                    "Instagram: burst detected in thread %s, fetching deeper.", thread_key)
-                deeper = client.direct_messages(
-                    thread_key, amount=self._burst_fetch_limit)
-                new_raw = []
-                boundary = None
-                for m in deeper:
-                    if m.id == cursor:
-                        boundary = m
-                        break
-                    new_raw.append(m)
-                raw = deeper or raw
+        The poller ingests every linked thread each cycle; listing the inbox once
+        per thread would multiply upstream calls by the number of users. Only a
+        burst (cursor scrolled out of the listing) still costs an extra call.
+        """
+        if not thread_keys:
+            return {}
 
-            if not new_raw:
-                return FetchResult()
+        with self._lock:
+            client = self._ensure_client()
+            if client is None:
+                raise RuntimeError("Instagram client is not configured")
 
-            context = [m for m in reversed(
-                new_raw) if m.user_id != client.user_id]
-            if boundary is not None:
-                context = [boundary] + context
+            threads = self._threads(client)
+            by_id = {str(t.id): t for t in threads}
 
-            items = self._items_from(context, thread.users, thread_key)
-            if boundary is not None:
-                items = [i for i in items if i.id != boundary.id]
-
-            cursor_new = raw[0].id if raw else None
-            return FetchResult(items=items, cursor=cursor_new)
+            out: dict[str, FetchResult] = {}
+            for key in thread_keys:
+                thread = by_id.get(str(key))
+                if thread is None:
+                    log.warning(
+                        "Instagram: linked thread %s not in the inbox batch", key)
+                    out[key] = FetchResult()
+                    continue
+                out[key] = self._fetch_from_thread(
+                    client, thread, key, cursors.get(key))
+            return out
 
     def history(self, thread_key: str | None, limit: int) -> list[InboundItem]:
         if not thread_key:

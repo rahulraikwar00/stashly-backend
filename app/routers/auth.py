@@ -1,14 +1,28 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..auth import get_code_store
+from ..config import Settings
+from ..dependencies import get_settings
 from ..models import (
     AuthStatusResponse,
     AuthUnlinkResponse,
     CodeRegisterRequest,
     CodeRegisterResponse,
+    ServerConfigResponse,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.get("/config", response_model=ServerConfigResponse)
+def server_config(settings: Settings = Depends(get_settings)) -> dict:
+    """The official account to DM, and the directive to send it.
+
+    Open by design, for the same reason POST /auth/codes is: the app has to tell
+    the user where to send `/link <code>` before it holds any code, so requiring
+    auth here would be circular. Exposes only a public handle.
+    """
+    return {"igUsername": settings.ig_username, "linkCommand": "/link"}
 
 
 @router.post("/codes", response_model=CodeRegisterResponse, status_code=201)

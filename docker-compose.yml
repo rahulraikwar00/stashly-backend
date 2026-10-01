@@ -1,0 +1,78 @@
+# Local packaging test for the backend image (D-018).
+#
+# ⚠️  THIS STACK CANNOT LINK AN INSTAGRAM ACCOUNT, EVER.
+#
+#   Two independent reasons, both of which have cost an afternoon already:
+#
+#   1. No IG_USERNAME/IG_PASSWORD, so `settings.instagram_configured` is False,
+#      `build_connector` returns None, and the link poller never starts. This
+#      image cannot touch the real account, so the test cannot be the thing that
+#      logs you out or trips a checkpoint.
+#
+#   2. The database is `tmpfs`, so **every link code is wiped whenever the
+#      container is recreated** — `docker compose up --build`, `down`, or any
+#      image change. The app keeps its code in its own on-device storage and
+#      will then get HTTP 404 "Code not registered." from /auth/status forever,
+#      while its Retry button re-checks the same code that no longer exists.
+#
+# If you want a code to actually link, do NOT use compose:
+#
+#   docker build -t stashly-backend:local .
+#   docker run --rm -p 3000:3000 --env-file .env stashly-backend:local
+#
+# That reads your real .env: persistent Neon (codes and the encrypted Instagram
+# session both survive restarts) and IG creds so the poller starts. Note it logs
+# into the real Instagram account — that is inherent to testing linking.
+#
+# What this actually verifies — and what only a real container build can:
+#
+#   1. The image builds (wheel availability for psycopg + cryptography on
+#      python:3.12-slim, which neither the local venv (3.10) nor your machine
+#      exercises).
+#   2. `python -m app` boots and the schema applies against real Postgres.
+#   3. /health reports the database reachable — TLS, pooling, DSN parsing.
+#   4. Nothing secret got baked into the image layer.
+#
+# Usage:
+#
+#   docker compose up --build -d
+#   docker compose logs api
+#   curl -s localhost:3000/health          # {"status":"ok","database":"ok"}
+#   docker compose exec api ls -la /app/app/   # must list NO *.json  <- the proof
+#   docker compose down -v
+#
+# For the real thing (real Neon + real Instagram), do NOT use compose:
+#
+#   docker build -t stashly-backend:local .
+#   docker run --rm -p 3000:3000 --env-file .env stashly-backend:local
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: testdb
+    tmpfs:
+      # Throwaway data dir: no volume, nothing survives `down`.
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+
+  api:
+    build: .
+    depends_on:
+      db:
+        # Wait for Postgres to accept connections, so the app's first pool
+        # connect does not race the database and mark the deploy unhealthy.
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      DATABASE_URL: postgresql://postgres:testpass@db:5432/testdb
+    restart: "no"

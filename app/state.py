@@ -46,3 +46,12 @@ class SeenStore:
 
 def get_seen_store(request: Request) -> SeenStore:
     return request.app.state.seen_store
+
+
+def build_seen_store(settings, pool):
+    """Pick the store: Postgres when `DATABASE_URL` is set, else the JSON file."""
+    if pool is not None:
+        from .db.seen_store import PgSeenStore
+
+        return PgSeenStore(pool)
+    return SeenStore(settings.seen_file)

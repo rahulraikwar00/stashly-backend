@@ -28,35 +28,99 @@ import threading
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .auth import CodeStore
+from .auth import build_code_store
 from .config import load_settings
 from .connectors import build_connector
+from .db.pool import close_pool, get_pool
+from .db.migrate import run_migrations
 from .poller import run_link_poller
 from .routers import auth as auth_router
 from .routers import debug as debug_router
 from .routers import health as health_router
 from .routers import messages as messages_router
 from .routers import metadata as metadata_router
-from .state import SeenStore
+from .state import build_seen_store
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s [%(name)s] %(message)s")
 
 _settings = load_settings()
 
-app = FastAPI(title="Bookmark Backend", version="2.0.0")
+app = FastAPI(title="Bookmark Backend", version="3.0.0")
 
-# The Expo app fetches this over the network; CORS only matters for web dev.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# The Expo app fetches this over the network and sends no browser Origin, so the
+# default is to allow nothing. Previously this was "*" for methods and headers too,
+# which is a needless wildcard behind an unauthenticated endpoint. Set
+# CORS_ORIGINS (comma-separated) to opt back in.
+if _settings.cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(_settings.cors_origins),
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-API-Key", "Authorization"],
+    )
+else:
+    logging.getLogger("main").warning(
+        "CORS disabled: no CORS_ORIGINS configured (expected for native clients)"
+    )
 
 app.state.settings = _settings
-app.state.connector = build_connector(_settings)
-app.state.code_store = CodeStore(_settings.links_file, ttl_seconds=_settings.code_ttl_seconds)
-app.state.seen_store = SeenStore(_settings.seen_file)
+
+# ── Postgres (D-018) ───────────────────────────────────────────────
+# Unset DATABASE_URL => the JSON-file stores stay in use (local development).
+_pool = get_pool(_settings.database_url) if _settings.postgres_configured else None
+if _pool is not None:
+    run_migrations(
+        _settings.database_url,
+        drop_channel_binding=_settings.drop_channel_binding,
+    )
+else:
+    logging.getLogger("main").warning(
+        "DATABASE_URL unset — using JSON stores in %s (ephemeral on Render)",
+        _settings.links_file.parent,
+    )
+
+_secret_store = None
+_mailbox = None
+_metadata_cache = None
+_failed_auth = None
+if _pool is not None:
+    from .db.failed_auth import PgFailedAuthStore
+    from .db.mailbox import PgMailboxStore
+    from .db.metadata_cache import PgMetadataCache
+    from .db.secrets import PgSecretStore
+
+    # A missing IG_SESSION_KEY is not an error: it means the Instagram session
+    # is kept in memory only and never written anywhere.
+    _session_key = None
+    if _settings.ig_session_key:
+        from .crypto import KeyError_, load_key
+
+        try:
+            _session_key = load_key(_settings.ig_session_key)
+        except KeyError_ as exc:
+            logging.getLogger("main").error(
+                "IG_SESSION_KEY invalid (%s) — session will not be persisted", exc
+            )
+    else:
+        logging.getLogger("main").warning(
+            "IG_SESSION_KEY unset — Instagram session stays in memory. On Render "
+            "that means a fresh login on every deploy, which risks the account."
+        )
+
+    _secret_store = PgSecretStore(_pool, _session_key)
+    _mailbox = PgMailboxStore(_pool, cap_per_thread=_settings.mailbox_cap_per_thread)
+    _metadata_cache = PgMetadataCache(
+        _pool, ttl_days=_settings.metadata_cache_days
+    )
+    _failed_auth = PgFailedAuthStore(_pool)
+
+app.state.secret_store = _secret_store
+app.state.mailbox = _mailbox
+app.state.metadata_cache = _metadata_cache
+app.state.failed_auth = _failed_auth
+app.state.connector = build_connector(_settings, secret_store=_secret_store)
+app.state.code_store = build_code_store(_settings, _pool)
+app.state.seen_store = build_seen_store(_settings, _pool)
 
 app.include_router(health_router.router)
 app.include_router(auth_router.router)
@@ -66,6 +130,23 @@ app.include_router(debug_router.router)
 
 _poller_stop = threading.Event()
 _poller_thread: threading.Thread | None = None
+
+
+def _prune_jobs() -> tuple:
+    """Periodic maintenance the poller runs every few cycles.
+
+    Keeps Neon inside its 0.5 GB ceiling and stops expired codes, cached metadata
+    and expired throttles accumulating forever.
+    """
+    jobs = []
+    if _mailbox is not None:
+        jobs.append(("mailbox", _mailbox.prune))
+        jobs.append(("expired codes", _mailbox.prune_expired_codes))
+    if _metadata_cache is not None:
+        jobs.append(("metadata cache", _metadata_cache.prune_expired))
+    if _failed_auth is not None:
+        jobs.append(("auth throttles", _failed_auth.prune_expired))
+    return tuple(jobs)
 
 
 @app.on_event("startup")
@@ -88,6 +169,13 @@ def on_startup() -> None:
             app.state.code_store,
             _settings.link_scan_seconds,
         ),
+        kwargs={
+            "seen_store": app.state.seen_store,
+            "mailbox": app.state.mailbox,
+            "caption_window_seconds": _settings.caption_window_seconds,
+            "settle_seconds": _settings.effective_settle_seconds,
+            "prune_jobs": _prune_jobs(),
+        },
         name="link-poller",
         daemon=True,
     )
@@ -100,11 +188,12 @@ def on_startup() -> None:
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
-    global _poller_stop, _poller_thread
+    global _poller_thread
     _poller_stop.set()
     if _poller_thread is not None:
         _poller_thread.join(timeout=3)
         _poller_thread = None
+    close_pool()
 
 
 if __name__ == "__main__":
