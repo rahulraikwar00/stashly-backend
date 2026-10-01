@@ -1,0 +1,52 @@
+# Opt-in override: swap Neon for a throwaway local Postgres.
+#
+# ONLY this file mentions a local Postgres. Nothing in the base stack does, so
+# reaching local storage is always a decision you type rather than one you
+# inherit:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build -d
+#
+# What you give up by using it:
+#
+#   1. No IG_USERNAME/IG_PASSWORD reach the container, so
+#      `settings.instagram_configured` is False, `build_connector` returns None
+#      and the link poller never starts. Nothing can link.
+#   2. The database is `tmpfs`, so every link code is wiped whenever the
+#      container is recreated (`up --build`, `down`, any image change). The app
+#      keeps its code in on-device storage and then gets HTTP 404 "Code not
+#      registered." from /auth/status forever, while Retry re-checks a code that
+#      no longer exists.
+#   3. `IG_SESSION_KEY` is unset here, so the Instagram session is never
+#      persisted. Irrelevant in practice given (1), but it is why the base stack
+#      sets it explicitly.
+#
+# So this is a schema-and-boot check — migrations apply against real Postgres,
+# TLS/pooling/DSN parsing get exercised — not a linking test.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: testdb
+    tmpfs:
+      # Throwaway data dir: no volume, nothing survives `down`.
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+
+  api:
+    depends_on:
+      db:
+        # Wait for Postgres to accept connections, so the app's first pool
+        # connect does not race the database and mark the container unhealthy.
+        condition: service_healthy
+    env_file: !reset null
+    environment:
+      PORT: "3000"
+      DB_BACKEND: "local"
+      DATABASE_URL: postgresql://postgres:testpass@db:5432/testdb

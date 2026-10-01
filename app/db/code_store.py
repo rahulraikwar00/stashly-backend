@@ -36,6 +36,9 @@ class PgCodeStore:
     def __init__(self, pool, ttl_seconds: int = 600) -> None:
         self._pool = pool
         self._ttl = ttl_seconds
+        # Set by the poller so a fresh registration interrupts its idle wait
+        # instead of being missed until the next long sleep.
+        self.on_register = None
 
     # ── persistence ────────────────────────────────────────────────
 
@@ -78,7 +81,24 @@ class PgCodeStore:
                 (code, now, now + self._ttl * 1000),
             )
             conn.commit()
+        if self.on_register is not None:
+            self.on_register()
         return {"code": code, "status": "pending", "expiresAt": now + self._ttl * 1000}
+
+    def has_pending(self) -> bool:
+        """True when a live pending code is waiting for its `/link` DM.
+
+        Expiry-aware so an abandoned code does not keep the poller at its fast
+        cadence: this is the cheap indexed `link_codes_pending_expiry` probe
+        rather than a full scan, and the poller calls it every cycle.
+        """
+        with self._pool.connection() as conn:
+            self._prune(conn)
+            return bool(
+                conn.execute(
+                    "SELECT 1 FROM link_codes WHERE status = 'pending' LIMIT 1"
+                ).fetchone()
+            )
 
     def attempt_bind(self, directive: LinkDirective) -> str:
         """Bind a `/link <code>` directive. Never raises.

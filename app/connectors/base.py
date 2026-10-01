@@ -76,8 +76,21 @@ class Connector(ABC):
         """Return the most recent `limit` items, oldest-first."""
 
     @abstractmethod
-    def scan_for_link_directives(self) -> list[LinkDirective]:
-        """Scan every thread for "/link <code>" directives (max one per thread)."""
+    def scan_for_link_directives(self, threads=None) -> list[LinkDirective]:
+        """Scan every thread for "/link <code>" directives (max one per thread).
+
+        `threads` may carry an already-fetched inbox listing so a poller cycle
+        can share one listing between the scan and the ingest. Connectors that
+        ignore it stay correct, just one extra request per cycle.
+        """
+
+    def fetch_cycle(self, thread_keys: list[str], cursors: dict[str, str | None]):
+        """One listing for both halves of a cycle: `(directives, results)`.
+
+        Optional. The default composes the two existing methods, so connectors
+        that don't override it behave exactly as before.
+        """
+        return self.scan_for_link_directives(), self.fetch_many(thread_keys, cursors)
 
     def fetch_many(
         self,

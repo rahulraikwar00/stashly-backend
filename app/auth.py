@@ -37,6 +37,9 @@ class CodeStore:
         self._ttl = ttl_seconds
         self._lock = threading.RLock()
         self._data: dict = {"threads": {}, "codes": {}}
+        # Set by the poller so a fresh registration interrupts its idle wait
+        # instead of being missed until the next long sleep.
+        self.on_register = None
         self._load()
 
     # ── persistence ────────────────────────────────────────────────
@@ -90,7 +93,25 @@ class CodeStore:
             }
             self._data["codes"][code] = entry
             self._save()
+            if self.on_register is not None:
+                self.on_register()
             return {"code": code, "status": "pending", "expiresAt": entry["expiresAt"]}
+
+    def has_pending(self) -> bool:
+        """True when a registered code is still awaiting its `/link` DM.
+
+        The poller uses this to decide between its fast and idle cadences: a
+        pending code is the only reason a `/link` directive can show up, so this
+        is the difference between scanning for a real event and scanning empty
+        inboxes. Expiry-aware, so a stale pending code does not pin the poller
+        at the fast cadence for the rest of the process's life.
+        """
+        with self._lock:
+            self._prune()
+            return any(
+                entry.get("status") == "pending"
+                for entry in self._data["codes"].values()
+            )
 
     def attempt_bind(self, directive: LinkDirective) -> str:
         """Try to bind a `/link <code>` directive. Never raises.

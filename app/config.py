@@ -18,7 +18,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_str(name: str, default: str = "") -> str:
-    return os.getenv(name, "").strip()
+    # Honours `default`; a bare os.getenv(name, "") silently discarded it, which
+    # only became visible once DB_BACKEND was the first caller to pass one.
+    return (os.getenv(name) or default).strip()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -41,14 +43,34 @@ class Settings:
 
     # ── Relay / linking ──
     code_ttl_seconds: int = 600  # pending link codes expire after 10 min
-    link_scan_seconds: int = 20  # poller cadence for detecting /link directives
+
+    # Poller cadence. The scan only does useful work while a user is mid-link, so
+    # it is event-driven rather than a fixed metronome: a fixed interval is both
+    # wasteful (nothing arrives outside a link window) and machine-shaped to
+    # Instagram. `link_scan_seconds` is the ACTIVE base, used only while a pending
+    # code exists; idle backs off to `link_scan_idle_seconds`.
+    link_scan_seconds: int = 30  # active base: someone is about to DM /link
+    link_scan_idle_seconds: int = 600  # idle base: nothing pending, back off
+    # Every wait is multiplied by a random factor in [1-jitter, 1+jitter], so no
+    # two cycles are evenly spaced. A constant cadence is a bot signature.
+    link_jitter_pct: int = 40
+    # Held after a failed cycle, and doubled while failures keep coming. Hammering
+    # an endpoint that is already rejecting is the worst response to a throttle.
+    link_error_backoff_seconds: int = 300
     threads_per_fetch: int = 10
     thread_message_limit: int = 40
     burst_fetch_limit: int = 200
     caption_window_seconds: int = 120
 
     # ── Postgres (D-018) ──
-    # Unset => the JSON-file stores are used (local development). Set on Render.
+    # Which Postgres is authoritative. "neon" (the default) means the only valid
+    # store is the Neon branch named by DATABASE_URL, and startup fails if that
+    # variable is missing rather than silently degrading to ephemeral storage.
+    # "local" is the explicit opt-in for a throwaway Postgres (docker compose
+    # override) and is never inferred from a hostname — a typo must not look like
+    # a request for the local one.
+    db_backend: str = "neon"
+    # Required when db_backend == "neon".
     database_url: str = ""
     # Neon sends `channel_binding=require`; the pooler does not negotiate it
     # reliably, so the DSN is stripped by default.
@@ -96,6 +118,10 @@ class Settings:
         return bool(self.database_url)
 
     @property
+    def using_local_postgres(self) -> bool:
+        return self.db_backend == "local"
+
+    @property
     def session_persistence_allowed(self) -> bool:
         """False when no key is configured, which forbids writing the session."""
         return bool(self.ig_session_key)
@@ -108,6 +134,9 @@ class Settings:
         return self.caption_window_seconds
 
 
+DB_BACKENDS = ("neon", "local")
+
+
 def load_settings() -> Settings:
     from dotenv import load_dotenv
 
@@ -115,18 +144,51 @@ def load_settings() -> Settings:
 
     caption_window = max(5, _env_int("CAPTION_WINDOW_SECONDS", 120))
     settle = _env_int("INGEST_SETTLE_SECONDS", 0)
+    db_backend = _env_str("DB_BACKEND", "neon").lower()
+
+    # Reject unknown values rather than treating them as "neon": DB_BACKEND=Local
+    # or DB_BACKEND=postgres would otherwise look like the local override while
+    # actually writing to Neon.
+    if db_backend not in DB_BACKENDS:
+        raise ValueError(
+            f"DB_BACKEND={db_backend!r} is not a valid backend; "
+            f"expected one of {', '.join(DB_BACKENDS)}"
+        )
+
+    database_url = _env_str("DATABASE_URL")
+
+    # Neon is the primary store, so a missing DSN is a misconfiguration that would
+    # otherwise boot the app onto storage it silently loses on restart.
+    if not database_url:
+        raise ValueError(
+            "DATABASE_URL is not set. The backend stores link codes, seen cursors "
+            "and the encrypted Instagram session in Postgres, so it refuses to "
+            "start without it. Copy .env.example to .env and set the Neon pooled "
+            "DSN (hostname must contain '-pooler')."
+        )
 
     return Settings(
         port=max(1, min(65535, _env_int("PORT", 8000))),
         ig_username=_env_str("IG_USERNAME"),
         ig_password=_env_str("IG_PASSWORD"),
         code_ttl_seconds=_env_int("CODE_TTL_SECONDS", 600),
-        link_scan_seconds=max(5, _env_int("LINK_SCAN_SECONDS", 20)),
+        # Floor is 15s, not 5: an over-eager LINK_SCAN_SECONDS used to be able to
+        # turn this into a fast poller, which is exactly the load pattern the
+        # jitter and idle backoff exist to avoid.
+        link_scan_seconds=max(15, _env_int("LINK_SCAN_SECONDS", 30)),
+        # Kept under the 600s code TTL on purpose: a user who DMs /link as their
+        # code is about to expire should still find it bound.
+        link_scan_idle_seconds=max(15, _env_int("LINK_SCAN_IDLE_SECONDS", 600)),
+        link_jitter_pct=min(90, max(0, _env_int("LINK_JITTER_PCT", 40))),
+        link_error_backoff_seconds=max(
+            15, _env_int("LINK_ERROR_BACKOFF_SECONDS", 300)
+        ),
         threads_per_fetch=max(1, _env_int("THREADS_PER_FETCH", 10)),
         thread_message_limit=max(5, _env_int("THREAD_MESSAGE_LIMIT", 40)),
         burst_fetch_limit=max(50, _env_int("BURST_FETCH_LIMIT", 200)),
         caption_window_seconds=caption_window,
-        database_url=_env_str("DATABASE_URL"),
+        db_backend=db_backend,
+        database_url=database_url,
         drop_channel_binding=_env_bool("DROP_CHANNEL_BINDING", True),
         ingest_settle_seconds=max(0, settle),
         mailbox_cap_per_thread=max(10, _env_int("MAILBOX_CAP_PER_THREAD", 500)),

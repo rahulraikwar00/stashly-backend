@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired
+from instagrapi.exceptions import (
+    ChallengeRequired,
+    FeedbackRequired,
+    LoginRequired,
+    ProxyAddressIsBlocked,
+    RateLimitError,
+)
 
 from .base import Connector, FetchResult, InboundItem, LinkDirective
 
@@ -187,6 +193,17 @@ class InstagramConnector(Connector):
                 self._client = None
                 return None
 
+    # A checkpoint is not a transient error: the account is being challenged for
+    # suspicious activity and the correct response is to stop calling, not to
+    # retry into it. It is a distinct exception here so the poller can back off
+    # hard instead of logging "link scan failed" and returning in 30s.
+    CHECKPOINT_ERRORS = (
+        ChallengeRequired,
+        FeedbackRequired,
+        RateLimitError,
+        ProxyAddressIsBlocked,
+    )
+
     def _threads(self, client: Client) -> list[Any]:
         try:
             return list(
@@ -195,6 +212,15 @@ class InstagramConnector(Connector):
                     thread_message_limit=self._thread_message_limit,
                 )
             )
+        except self.CHECKPOINT_ERRORS as exc:
+            # Propagate: swallowing this would have the poller treating a
+            # challenge as "no directives" and immediately asking again.
+            log.error(
+                "Instagram: challenge/rate-limit while listing the DM inbox (%s). "
+                "The poller will back off; do not restart it on a short loop.",
+                type(exc).__name__,
+            )
+            raise
         except LoginRequired:
             log.warning("Instagram: session expired mid-fetch, re-logging in.")
             self._client = self._fresh_client()
@@ -381,13 +407,22 @@ class InstagramConnector(Connector):
             oldest = [m for m in reversed(raw) if m.user_id != client.user_id]
             return self._items_from(oldest, thread.users, thread_key)
 
-    def scan_for_link_directives(self) -> list[LinkDirective]:
+    def scan_for_link_directives(self, threads=None) -> list[LinkDirective]:
+        """Find `/link <code>` DMs.
+
+        `threads` accepts an already-fetched inbox listing, so a poller cycle
+        that also ingests can list the inbox once instead of twice. Previously
+        each cycle made two identical `direct_threads` calls — one here, one in
+        `fetch_many` — which doubled the load on the account for no extra
+        information.
+        """
         with self._lock:
             client = self._ensure_client()
             if client is None:
                 return []
 
-            threads = self._threads(client)
+            if threads is None:
+                threads = self._threads(client)
             directives: list[LinkDirective] = []
             own_id = getattr(client, "user_id", None)
 
@@ -414,3 +449,33 @@ class InstagramConnector(Connector):
                     break  # one directive per thread per scan
 
             return directives
+
+    def fetch_cycle(self, thread_keys: list[str], cursors: dict[str, str | None]):
+        """One inbox listing, served to both halves of a poller cycle.
+
+        Returns `(directives, results)`. Fetches the inbox once, scans it for
+        `/link` directives, and serves the ingest from the same listing — the
+        single change that halves the per-cycle request count.
+        """
+        results: dict[str, FetchResult] = {}
+        with self._lock:
+            client = self._ensure_client()
+            if client is None:
+                return [], results
+
+            threads = self._threads(client)
+            directives = self.scan_for_link_directives(threads=threads)
+            by_id = {str(t.id): t for t in threads}
+
+            for key in thread_keys:
+                thread = by_id.get(key)
+                if thread is None:
+                    log.warning(
+                        "Instagram: linked thread %s not in the inbox batch", key
+                    )
+                    continue
+                results[key] = self._fetch_from_thread(
+                    client, thread, key, cursors.get(key)
+                )
+
+        return directives, results

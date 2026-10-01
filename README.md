@@ -12,18 +12,37 @@ Architecture and design decisions live in the app repo
 - `DesingDecision/decisions.md` **D-018** — Render deploy, Postgres state,
   buffered mailbox, encrypted session
 
-## Two modes
+## One primary store: Neon
 
-The same code runs in two modes, chosen by whether `DATABASE_URL` is set:
+Neon is the primary store for every durable fact. `DATABASE_URL` is **required** —
+if it is missing the app raises at startup rather than quietly running on storage
+it would lose on the next restart:
 
-| | `DATABASE_URL` unset | `DATABASE_URL` set (production) |
+| | Value | Notes |
 | --- | --- | --- |
-| State | `links.json`, `seen_messages.json` | Postgres |
-| `/messages/links` | live Instagram fetch per request | drains the poller's buffer |
-| Instagram session | `session.json` | encrypted in `app_secrets` |
+| State | Postgres (`link_codes`, `thread_links`, `seen_cursors`, `pending_items`, `metadata_cache`, `app_secrets`, `failed_auth`) | survives restarts and container rebuilds |
+| `/messages/links` | drains the poller's buffered mailbox | no live Instagram fetch per request |
+| Instagram session | encrypted in `app_secrets` under `IG_SESSION_KEY` | never written in plaintext |
 
-Local development needs no database: the JSON stores are the default and the
-whole suite runs without one.
+`DB_BACKEND` selects which Postgres, and is validated at startup:
+
+| `DB_BACKEND` | Meaning |
+| --- | --- |
+| `neon` (default) | `DATABASE_URL` must name a Neon pooled DSN. Missing → startup error. |
+| `local` | the only way to use a throwaway Postgres; pair it with a local `DATABASE_URL`. |
+
+Any other value is a startup error, so a typo like `DB_BACKEND=postgres` fails
+loudly instead of silently writing to Neon.
+
+To run against a local Postgres instead of Neon, use the compose override — it is
+the only file that mentions one:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml up --build -d
+```
+
+The plain `docker compose up` uses Neon, because that is the point: reaching
+disposable storage is something you ask for, not something you inherit.
 
 ## Run
 
@@ -31,7 +50,7 @@ whole suite runs without one.
 cd backend
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-cp .env.example .env   # set PORT + IG_USERNAME / IG_PASSWORD
+cp .env.example .env   # set DATABASE_URL, PORT, IG_USERNAME / IG_PASSWORD
 .venv/bin/python -m app
 ```
 
@@ -39,29 +58,79 @@ The serving port comes from `PORT` in `.env` (default 8000); the app's "Self-hos
 server" URL / dev fallback must match it.
 
 `/metadata` and `/health` work with no Instagram credentials. Setting
-`IG_USERNAME`/`IG_PASSWORD` enables the relay + link-poller + ingest. With
-`DATABASE_URL` also set, the connector persists its session **encrypted** under
-`IG_SESSION_KEY` — without that key it keeps the session in memory only, which
-is fine locally and dangerous on Render.
+`IG_USERNAME`/`IG_PASSWORD` enables the relay + link-poller + ingest. The
+connector persists its session **encrypted** under `IG_SESSION_KEY`; without that
+key it stays in memory only, which means a fresh login on every deploy and is
+dangerous on Render.
+
+## Account safety: why the poller is not a fixed interval
+
+A `/link <code>` DM can only arrive while a user is mid-link — they register a
+code, then DM it. Polling at a constant short interval to catch that one event
+spends nearly all of its calls on empty inboxes, and an evenly spaced interval
+is a machine signature Instagram can pick up trivially. So the cadence is
+derived from the work actually outstanding:
+
+| Mode | Cadence | When |
+| --- | --- | --- |
+| Active | `LINK_SCAN_SECONDS` (30) ± `LINK_JITTER_PCT` (40) | a registered code is still pending |
+| Idle | `LINK_SCAN_IDLE_SECONDS` (600) ± jitter | nothing pending |
+| Backoff | `LINK_ERROR_BACKOFF_SECONDS` (300), doubling, 1h cap | the last cycle raised |
+
+Three further choices in the same spirit:
+
+- **One inbox listing per cycle.** The scan and the ingest used to each call
+  `direct_threads` independently, doubling the request count for identical data.
+  `Connector.fetch_cycle` serves both from one listing; connectors that don't
+  implement it keep the old two-call path.
+- **Expiring codes don't pin the fast cadence.** `has_pending()` is expiry-aware
+  on both stores, so an abandoned code falls back to idle instead of polling hard
+  for the rest of the process's life.
+- **A checkpoint is not retried into it.** `ChallengeRequired`, `FeedbackRequired`,
+  `RateLimitError` and `ProxyAddressIsBlocked` propagate out of the listing call
+  so the poller backs off. Only `LoginRequired` triggers a re-login. A challenge
+  means the account is under scrutiny, and hammering through it is how a session
+  gets lost.
+
+The floor on `LINK_SCAN_SECONDS` is 15s, not 5: a misconfigured value should not
+be able to turn this into a fast poller.
+
+None of this is a guarantee — Instagram weighs IP reputation, login frequency and
+interaction patterns too. What is load-bearing is that the account is dedicated,
+has 2FA, and that `IG_SESSION_KEY` keeps the session across restarts so the app
+reuses a persisted session rather than re-logging-in. `IG_SESSION_KEY` must be
+**stable**: rotating it makes the stored session undecryptable and forces a fresh
+login, which is the single most likely cause of a checkpoint.
 
 ## Deploying to Render (free tier)
 
+`render.yaml` is a blueprint, so the service is reproducible from the repo rather
+than from a dashboard ritual. Push the repo to GitHub, connect it in Render, and
+it prompts for the four secrets.
+
 1. Create a Neon project, copy the **pooled** connection string (hostname
    contains `-pooler`).
-2. Render → Web Service, root directory `backend`, start command `python -m app`,
-   health check path `/health`.
+2. Render → Blueprint, pointing at the repo, or Web Service with root directory
+   `.`, runtime Docker, start command `python -m app`, health check `/health`.
 3. Env vars: `DATABASE_URL`, `IG_USERNAME`, `IG_PASSWORD`, `IG_SESSION_KEY`
-   (generate with `openssl rand -hex 32`). **Do not set `PORT`.**
+   (`openssl rand -hex 32`). **Do not set `PORT`** — Render injects 10000 and the
+   Dockerfile already defaults to it.
 4. UptimeRobot monitor on `https://<service>.onrender.com/health`, 5-minute
    interval.
 
-Two free-tier behaviours to know:
+Free-tier behaviours to know:
 
-- The service sleeps after 15 minutes idle. The keep-alive prevents that, and
-  even if it fails, linking only *delays* — `scan_for_link_directives` re-reads
-  recent threads each cycle, so a `/link` sent while asleep is found on wake.
+- The service sleeps after 15 minutes idle. UptimeRobot prevents that, and even
+  if it fails, linking only *delays* — `scan_for_link_directives` re-reads recent
+  threads each cycle, so a `/link` sent while asleep is found on wake. With the
+  idle backoff the instance has almost nothing to do anyway, so sleeping costs
+  nothing real.
 - Free instances have an **ephemeral disk**, which is why all state lives in
-  Postgres and the session is encrypted there rather than in a file.
+  Postgres and the session is encrypted there rather than in a file. A cold start
+  reuses the persisted session, so it does not re-authenticate against Instagram.
+- `/health` deliberately returns 200 while degraded, because Render restarts an
+  instance after 60s of failing checks and a restart means a fresh Instagram
+  login. Use `?strict=1` for a hard gate in monitoring.
 
 Migrating existing local state once:
 
@@ -95,8 +164,11 @@ which codes exist.
 2. User opens Instagram and DMs the official account: `/link 123456`.
    The account handle comes from `GET /auth/config` (`IG_USERNAME` server-side) —
    the client no longer hardcodes it, so the two cannot drift.
-3. The poller (every ~20s) sees the directive and binds **code → that thread**
-   (first-touch-wins; the code expires on bind).
+3. The poller sees the directive and binds **code → that thread**
+   (first-touch-wins; the code expires on bind). It scans every ~30s ±40% while
+   a code is pending — the only window in which a `/link` can arrive — and backs
+   off to ~10 min ±40% when nothing is pending, so the account is not polled for
+   events that cannot occur.
 4. App calls `GET /messages/links` with `X-API-Key: 123456` → the backend relays
    **only that thread's** buffered reels as bookmark-shaped rows and consumes them.
 
@@ -184,7 +256,11 @@ source .venv/bin/activate
 python -m pytest tests/ -q
 ```
 
-Database-backed tests skip unless `TEST_DATABASE_URL` is set. To run them:
+Database-backed tests skip unless `TEST_DATABASE_URL` is set.
+
+⚠️ **Never point `TEST_DATABASE_URL` at your main Neon branch.** `tests/conftest.py`
+calls `truncate_all()` on it, which deletes every link code and the stored
+Instagram session. Use a separate Neon `test` branch, or a local Postgres:
 
 ```bash
 docker run -d --name d018test -e POSTGRES_PASSWORD=testpass \
