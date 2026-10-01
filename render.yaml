@@ -1,0 +1,55 @@
+# Render blueprint: the backend as a free-tier web service.
+#
+# Deploys the real stack — Neon for every durable fact (D-018) — so link codes,
+# seen cursors and the encrypted Instagram session survive restarts and image
+# rebuilds.
+#
+# Setup, in order:
+#
+#   1. `cp .env.example .env`, then set DATABASE_URL (the Neon *pooled* DSN,
+#      hostname contains `-pooler`) and IG_SESSION_KEY (`openssl rand -hex 32`).
+#   2. Push this repo to GitHub and connect it in Render.
+#   3. In Render, set the secret env vars this file cannot: DATABASE_URL,
+#      IG_USERNAME, IG_PASSWORD, IG_SESSION_KEY. The blueprint declares them as
+#      `sync: false`, which is Render's marker for "prompt me, never commit".
+#   4. UptimeRobot monitor on /health every 5 minutes (see README).
+#
+# The values below are safe to commit: no credentials, and no DATABASE_URL.
+services:
+  - type: web
+    name: stashly-backend
+    runtime: docker          # the Dockerfile already targets Render's PORT=10000
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    # `python -m app`, matching the Dockerfile CMD. PORT is injected by Render —
+    # never set it here, or the container listens where nothing is proxying.
+    startCommand: python -m app
+    envVars:
+      # Neon is the primary store; the app refuses to start without a DSN, so a
+      # missing one fails the deploy instead of silently writing link codes
+      # somewhere disposable.
+      - key: DB_BACKEND
+        value: neon
+      # Never commit a DSN or a credential. Render prompts for each at deploy.
+      - key: DATABASE_URL
+        sync: false
+      - key: IG_USERNAME
+        sync: false
+      - key: IG_PASSWORD
+        sync: false
+      # Changing this makes the stored session undecryptable, forcing a fresh
+      # Instagram login — which is the thing most likely to trip a checkpoint.
+      - key: IG_SESSION_KEY
+        sync: false
+      # Cadence; the defaults are deliberate, see .env.example.
+      - key: LINK_SCAN_SECONDS
+        value: "30"
+      - key: LINK_SCAN_IDLE_SECONDS
+        value: "600"
+      - key: LINK_JITTER_PCT
+        value: "40"
+      - key: LINK_ERROR_BACKOFF_SECONDS
+        value: "300"

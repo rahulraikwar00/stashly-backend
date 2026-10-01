@@ -1,27 +1,61 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..auth import get_code_store
+from ..config import Settings
+from ..dependencies import get_settings
 from ..models import (
     AuthStatusResponse,
     AuthUnlinkResponse,
     CodeRegisterRequest,
     CodeRegisterResponse,
+    ServerConfigResponse,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _server_identity(settings: Settings) -> dict:
+    """Public server identity merged into the register response.
+
+    Deliberately assembled here and not inside CodeStore: the stores are
+    persistence layers that must not know about Instagram configuration.
+    """
+    return {
+        "igUsername": settings.ig_username,
+        "linkCommand": "/link",
+        "instagramConfigured": settings.instagram_configured,
+    }
+
+
+@router.get("/config", response_model=ServerConfigResponse)
+def server_config(settings: Settings = Depends(get_settings)) -> dict:
+    """The official account to DM, and the directive to send it.
+
+    Open by design, for the same reason POST /auth/codes is: the app has to tell
+    the user where to send `/link <code>` before it holds any code, so requiring
+    auth here would be circular. Exposes only a public handle.
+
+    POST /auth/codes returns the same three fields for the connect path; this
+    endpoint is the restart fallback, for a code the device already holds.
+    """
+    return _server_identity(settings)
 
 
 @router.post("/codes", response_model=CodeRegisterResponse, status_code=201)
 def register_code(
     body: CodeRegisterRequest,
     code_store=Depends(get_code_store),
+    settings: Settings = Depends(get_settings),
 ) -> dict:
     """Register a fresh 6-digit code for the DM linking flow.
 
     The code is *pending* until the user DMs the official account with
     `/link <code>`; it expires after `CODE_TTL_SECONDS` (~10 min).
+
+    The response carries the server's identity too, so the client can show
+    where to DM from this same round trip instead of asking separately.
     """
-    return code_store.register(body.code)
+    return {**code_store.register(body.code), **_server_identity(settings)}
 
 
 @router.get("/status", response_model=AuthStatusResponse)

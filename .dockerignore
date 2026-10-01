@@ -1,0 +1,31 @@
+# Build-context hygiene for the backend image.
+#
+# The load-bearing rule is `app/*.json` below. Those files are the Instagram
+# session (a live `sessionid` cookie — equivalent to being logged in as the
+# official account) plus the link-code and seen-cursor state. They are
+# gitignored, so a `git push` is safe, but `COPY app ./app` would still pull
+# them into an image layer where `docker history` exposes them. Production state
+# lives in Postgres, so the image never needs them.
+
+# ── Secrets and account state ─────────────────────────────────────
+.env
+app/*.json
+*.session.json
+
+# ── Virtualenv ────────────────────────────────────────────────────
+# ~180 MB, and a different interpreter than the image's.
+.venv/
+venv/
+
+# ── Bytecode and test artifacts ───────────────────────────────────
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+tests/
+
+# ── Repo metadata ─────────────────────────────────────────────────
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml

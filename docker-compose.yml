@@ -1,0 +1,35 @@
+# The real stack: Neon for every durable fact (D-018).
+#
+# This file boots the API against the Neon branch named by DATABASE_URL in your
+# .env, so link codes, seen cursors, the buffered mailbox and the encrypted
+# Instagram session all survive `docker compose down` / `up` and any image
+# rebuild. It is the default because Neon is the primary store — there is
+# nothing to remember to pass here.
+#
+#   cp .env.example .env      # then fill in DATABASE_URL + IG_SESSION_KEY
+#   docker compose up --build -d
+#   docker compose logs api
+#   curl -s localhost:3000/health
+#   curl -s localhost:3000/auth/config
+#
+# IG_USERNAME/IG_PASSWORD come from .env too, so the link poller starts and this
+# stack CAN link a real account. Note that testing linking means logging into the
+# real Instagram account — that is inherent to the feature, not a flaw here.
+#
+# For a throwaway local Postgres instead (no real data, no Instagram login), use
+# the override — it is the one place that asks for local Postgres out loud:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build -d
+#
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      PORT: "3000"
+      # Fail fast rather than silently writing link codes somewhere disposable.
+      DB_BACKEND: "neon"
+    restart: "no"

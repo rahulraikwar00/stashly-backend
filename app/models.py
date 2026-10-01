@@ -45,6 +45,14 @@ class CodeRegisterResponse(BaseModel):
     code: str
     status: str = "pending"
     expiresAt: int | None = None  # epoch ms
+    # The official account to DM, served with the code the user is about to act
+    # on, so the client needs no second request before it can render the DM step.
+    igUsername: str = ""
+    linkCommand: str = "/link"
+    # Not derivable from igUsername: a half-configured server can have
+    # IG_USERNAME without IG_PASSWORD, which means no poller and nothing will
+    # ever bind. The client must be able to tell that from "working".
+    instagramConfigured: bool = False
 
 
 class AuthStatusResponse(BaseModel):
@@ -64,3 +72,18 @@ class AuthUnlinkResponse(BaseModel):
 class DebugResetResponse(BaseModel):
     status: str
     thread: str
+
+
+class ServerConfigResponse(BaseModel):
+    """Public server identity — the official account the user must DM.
+
+    Served instead of hardcoded in the client, which is how the handle drifted
+    between IG_USERNAME and the app more than once. `igUsername` is "" when
+    Instagram is not configured, never null, so the client can always render a
+    fallback rather than "@None". `instagramConfigured` separates "reachable but
+    has no Instagram account" from "has an account but nothing will bind".
+    """
+
+    igUsername: str = ""
+    linkCommand: str = "/link"
+    instagramConfigured: bool = False

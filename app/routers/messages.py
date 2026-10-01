@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query
 
 from ..auth import LinkedAccount, get_code_store, require_code
 from ..config import Settings
-from ..dependencies import get_connector, get_settings
+from ..dependencies import get_connector, get_mailbox, get_settings
 from ..enrich import enrich
 from ..models import BookmarkResponse
 from ..state import get_seen_store
@@ -34,15 +34,29 @@ def links(
     seen=Depends(get_seen_store),
     code_store=Depends(get_code_store),
     settings: Settings = Depends(get_settings),
+    mailbox=Depends(get_mailbox),
 ) -> list[BookmarkResponse]:
     """THE real endpoint: new forwarded reels for your thread, full bookmark
-    shape, and consumes that thread's seen-state (won't repeat)."""
+    shape, and consumes them (won't repeat).
+
+    With a mailbox configured (D-018) this is a transactional drain of the
+    poller's buffer: no Instagram call, no seen-cursor mutation, ~5 ms. The
+    poller ingests once per cycle and advances its own cursor, so N devices
+    pulling on refresh no longer mean N instagrapi round-trips.
+
+    Without one — local development, no DATABASE_URL — it falls back to the
+    original live fetch so the JSON setup keeps working unchanged.
+    """
+    if mailbox is not None:
+        return [BookmarkResponse(**row) for row in
+                mailbox.drain(account.thread_id, settings.mailbox_drain_limit)]
+
     result = connector.fetch_new(account.thread_id, seen.get(account.thread_id))
-    links, _ = enrich(result.items, settings.caption_window_seconds)
+    rows, _ = enrich(result.items, settings.caption_window_seconds)
     if result.items and result.cursor:
         seen.set(account.thread_id, result.cursor)
-    links.sort(key=lambda b: b.timestamp or 0)
-    return links
+    rows.sort(key=lambda b: b.timestamp or 0)
+    return rows
 
 
 @router.get("/history", response_model=list[BookmarkResponse])

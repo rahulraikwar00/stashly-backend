@@ -9,6 +9,7 @@ authenticate with the code and are scoped to the bound thread.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security.utils import get_authorization_scheme_param
 
 from .connectors.base import LinkDirective
+
+_log = logging.getLogger("auth")
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,9 @@ class CodeStore:
         self._ttl = ttl_seconds
         self._lock = threading.RLock()
         self._data: dict = {"threads": {}, "codes": {}}
+        # Set by the poller so a fresh registration interrupts its idle wait
+        # instead of being missed until the next long sleep.
+        self.on_register = None
         self._load()
 
     # ── persistence ────────────────────────────────────────────────
@@ -87,7 +93,25 @@ class CodeStore:
             }
             self._data["codes"][code] = entry
             self._save()
+            if self.on_register is not None:
+                self.on_register()
             return {"code": code, "status": "pending", "expiresAt": entry["expiresAt"]}
+
+    def has_pending(self) -> bool:
+        """True when a registered code is still awaiting its `/link` DM.
+
+        The poller uses this to decide between its fast and idle cadences: a
+        pending code is the only reason a `/link` directive can show up, so this
+        is the difference between scanning for a real event and scanning empty
+        inboxes. Expiry-aware, so a stale pending code does not pin the poller
+        at the fast cadence for the rest of the process's life.
+        """
+        with self._lock:
+            self._prune()
+            return any(
+                entry.get("status") == "pending"
+                for entry in self._data["codes"].values()
+            )
 
     def attempt_bind(self, directive: LinkDirective) -> str:
         """Try to bind a `/link <code>` directive. Never raises.
@@ -189,19 +213,72 @@ def get_code_store(request: Request) -> CodeStore:
     return request.app.state.code_store
 
 
+def build_code_store(settings, pool):
+    """Pick the store: Postgres when `DATABASE_URL` is set, else links.json.
+
+    The JSON store stays the local-development default so the suite runs with no
+    database configured. Imports are lazy because `app.db.code_store` needs
+    `LinkedAccount` from this module.
+    """
+    if pool is not None:
+        from .db.code_store import PgCodeStore
+
+        return PgCodeStore(pool, ttl_seconds=settings.code_ttl_seconds)
+    return CodeStore(settings.links_file, ttl_seconds=settings.code_ttl_seconds)
+
+
 def require_code(
     request: Request,
     code_store: CodeStore = Depends(get_code_store),
 ) -> LinkedAccount:
     """Auth dependency: resolve `X-API-Key: <code>` or `Bearer <code>` to a
-    linked account. 401 otherwise."""
+    linked account. 401 otherwise.
+
+    Every failure mode returns a byte-identical 401 — unknown, pending, expired,
+    or throttled — so the endpoint never confirms which codes exist. Throttling
+    is per code, not per IP (see `app/db/failed_auth.py`).
+    """
+    denied = HTTPException(
+        status_code=401, detail="Invalid or unlinked API code.")
+
     x_api_key = request.headers.get("x-api-key", "")
     authorization = request.headers.get("authorization", "")
     code = x_api_key.strip()
     if not code and authorization:
         _, value = get_authorization_scheme_param(authorization)
         code = value.strip()
+
+    if not code:
+        raise denied
+
+    settings = getattr(request.app.state, "settings", None)
+    failed_auth = getattr(request.app.state, "failed_auth", None)
+    max_failures = getattr(settings, "auth_max_failures", 5)
+    lock_seconds = getattr(settings, "auth_lock_seconds", 900)
+
+    if failed_auth is not None:
+        try:
+            if failed_auth.is_locked(code):
+                raise denied
+        except HTTPException:
+            raise
+        except Exception:
+            # Fail open on a throttling-infrastructure error: a database blip must
+            # not lock every real user out of their own bookmarks.
+            _log.warning("auth throttling unavailable; proceeding unthrottled")
+
     account = code_store.resolve(code)
     if account is None:
-        raise HTTPException(status_code=401, detail="Invalid or unlinked API code.")
+        if failed_auth is not None:
+            try:
+                failed_auth.record_failure(code, max_failures, lock_seconds)
+            except Exception:
+                _log.warning("could not record auth failure for code=%s", code)
+        raise denied
+
+    if failed_auth is not None:
+        try:
+            failed_auth.clear(code)
+        except Exception:
+            pass
     return account

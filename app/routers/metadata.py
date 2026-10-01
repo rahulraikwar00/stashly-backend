@@ -12,7 +12,7 @@ import time
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..extract import _user_agent_for, extract_metadata
 from ..guards import validate_public_url
@@ -48,10 +48,42 @@ def metadata(
     url: str = Query(...),
     timeout_ms: int = Query(12000, ge=1000, le=20000),
     debug: bool = Query(False),
+    request: Request = None,
 ) -> dict:
-    """Extract page metadata for an arbitrary public http(s) URL."""
+    """Extract page metadata for an arbitrary public http(s) URL.
+
+    Read-through cached when a database is configured (D-018): this is the
+    highest-cardinality, slowest, most repeated operation in the service, and the
+    only endpoint that could see a traffic spike. A hit costs one primary-key
+    lookup instead of a full fetch-and-parse.
+    """
     target = validate_public_url(url)
     started = time.perf_counter()
+
+    cache = None
+    if request is not None:
+        cache = getattr(request.app.state, "metadata_cache", None)
+
+    if cache is not None:
+        from ..enrich import url_hash
+
+        try:
+            hit = cache.get(url_hash(target))
+        except Exception:
+            logger.exception("metadata cache read failed; falling through")
+            hit = None
+        if hit is not None:
+            logger.info(
+                "url=%s status=cache-hit host=%s elapsed=%sms",
+                target,
+                urlsplit(target).hostname or "?",
+                round((time.perf_counter() - started) * 1000, 1),
+            )
+            if debug:
+                hit = dict(hit)
+                hit["trace"] = {"cached": True}
+            return hit
+
     try:
         result = extract_metadata(target, timeout_ms=timeout_ms)
     except httpx.TimeoutException as exc:
@@ -66,6 +98,14 @@ def metadata(
     except httpx.RequestError as exc:
         _log_request(started, url, "request-error")
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
+
+    if cache is not None:
+        try:
+            from ..enrich import url_hash
+
+            cache.put(url_hash(target), target, result)
+        except Exception:
+            logger.exception("metadata cache write failed; ignoring")
 
     _log_request(started, url, "ok", result)
     if debug:
